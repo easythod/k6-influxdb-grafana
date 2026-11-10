@@ -1,0 +1,70 @@
+name: k6
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Load profile
+        type: choice
+        options: [smoke, load, stress, spike]
+        default: smoke
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  load-test:
+    needs: typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PROFILE: ${{ inputs.profile || 'smoke' }}
+      TESTID: ci-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start the stack
+        run: docker compose up -d --wait
+
+      # Thresholds are the quality gate: if any of them is breached, k6 exits with code 99 and the job fails.
+      - name: Run k6 (${{ env.PROFILE }})
+        run: make test PROFILE="$PROFILE" TESTID="$TESTID"
+
+      - name: Verify metrics reached InfluxDB, Prometheus and Grafana
+        if: always()
+        run: |
+          set -euo pipefail
+          influx=$(curl -sf -G http://localhost:8086/query --data-urlencode db=k6 \
+            --data-urlencode "q=SELECT count(value) FROM http_reqs WHERE testid='$TESTID'" | jq '.results[0].series[0].values[0][1] // 0')
+          prom=$(curl -sf -G http://localhost:9090/api/v1/query \
+            --data-urlencode "query=sum(max_over_time(k6_http_reqs_total{testid=\"$TESTID\"}[1h]))" | jq -r '.data.result[0].value[1] // "0"')
+          dashboards=$(curl -sf "http://localhost:3000/api/search?type=dash-db&tag=k6" | jq length)
+          echo "InfluxDB requests: $influx, Prometheus requests: $prom, Grafana k6 dashboards: $dashboards"
+          test "$influx" -gt 0 && test "${prom%.*}" -gt 0 && test "$dashboards" -eq 2
+
+      - name: Upload k6 HTML report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: k6-report-${{ env.PROFILE }}
+          path: reports/*.html
+          if-no-files-found: warn
+
+      - name: Service logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=200

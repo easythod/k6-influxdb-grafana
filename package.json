@@ -1,0 +1,12 @@
+{
+  "name": "k6-observability",
+  "private": true,
+  "description": "Type checking for the k6 TypeScript tests. k6 itself runs the .ts files directly; npm is only needed for editor types and CI.",
+  "scripts": {
+    "typecheck": "tsc"
+  },
+  "devDependencies": {
+    "@types/k6": "2.3.0",
+    "typescript": "7.0.2"
+  }
+}

@@ -1,57 +1,108 @@
-version: '1.0'
+name: k6-observability
 
-networks:
-  k6:
-  grafana:
+# Ports are bound to 127.0.0.1 only: this is a local test stack with default credentials.
 
 services:
-  influxdb:
-    image: influxdb:1.8
-    networks:
-      - k6
-      - grafana
+  # System under test: a local copy of restful-booker, so load tests never hit a shared public service.
+  # Built from source at a pinned commit, so the image is native for the host (arm64 on Apple Silicon,
+  # amd64 elsewhere). The published Docker Hub image is amd64 only; see compose.prebuilt.yml.
+  restful-booker:
+    image: restful-booker:local
+    build:
+      context: https://github.com/mwinteringham/restful-booker.git#00461155995c8636866bf51dc444f63033da44fb
     ports:
-      - "8086:8086"
+      - "127.0.0.1:3001:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3001/ping', r => process.exit(r.statusCode === 201 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  influxdb:
+    image: influxdb:1.12.4
     environment:
-      - INFLUXDB_DB=k6
+      INFLUXDB_DB: k6
+      INFLUXDB_HTTP_LOG_ENABLED: "false"
+    ports:
+      - "127.0.0.1:8086:8086"
+    volumes:
+      - influxdb-data:/var/lib/influxdb
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8086/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-remote-write-receiver # k6 pushes metrics via remote write
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   grafana:
-    image: grafana/grafana:8.5.21
-    networks:
-      - grafana
-    ports:
-      - "3000:3000"
+    image: grafana/grafana:13.2.4
     environment:
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
-      - GF_AUTH_ANONYMOUS_ENABLED=true
-      - GF_AUTH_BASIC_ENABLED=false
-      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      # Anonymous visitors are viewers (the only role Grafana 13 allows for them), but may tweak panels
+      # and use Explore. Sign in as admin/admin to save changes.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_USERS_VIEWERS_CAN_EDIT: "true"
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/prometheus/k6-prometheus.json
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    ports:
+      - "127.0.0.1:3000:3000"
     volumes:
-      - ./dashboards:/var/lib/grafana/dashboards
-      - ./grafana-dashboard.yaml:/etc/grafana/provisioning/dashboards/dashboard.yaml
-      - ./grafana-datasource.yaml:/etc/grafana/provisioning/datasources/datasource.yaml
-
-  chronograf:
-    image: chronograf:1.8
-    ports:
-      - "8888:8888"
-    environment:
-      - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_USERNAME=root
-      - INFLUXDB_PASSWORD=root
-      - INFLUXDB_SKIP_VERIFY=true
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
     depends_on:
-      - influxdb
-    networks:
-      - k6  
+      influxdb:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
+  # Test runner. Not started by `docker compose up`; run it with `docker compose run --rm k6 ...` or `make test`.
   k6:
-    image: grafana/k6
-    networks:
-      - k6
-    ports:
-      - "6565:6565"
+    image: grafana/k6:2.3.0
+    profiles: ["runner"]
     environment:
-      - K6_OUT=influxdb=http://influxdb:8086/k6
+      BASE_URL: http://restful-booker:3001
+      K6_INFLUXDB_PUSH_INTERVAL: 1s
+      K6_INFLUXDB_TAGS_AS_FIELDS: vu:int,iter:int,url # keeps high-cardinality values out of series keys
+      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_PUSH_INTERVAL: 1s
+      # Native histograms give true per-interval percentiles (plain trend stats are cumulative since test start).
+      K6_FEATURES: native-histograms
+      K6_WEB_DASHBOARD: "true"
+      K6_WEB_DASHBOARD_PORT: "5665"
+    ports:
+      - "127.0.0.1:5665:5665" # live k6 web dashboard while a test runs
     volumes:
-      - ./scripts:/scripts
+      - ./tests:/tests:ro
+      - ./reports:/reports
+    depends_on:
+      restful-booker:
+        condition: service_healthy
+
+volumes:
+  influxdb-data:
+  prometheus-data:
+  grafana-data:

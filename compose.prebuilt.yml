@@ -1,0 +1,11 @@
+# Optional override: use the published restful-booker image instead of building it from source.
+# Starts faster (nothing to build), but the image exists for amd64 only, so on Apple Silicon
+# it runs under emulation and latency numbers are higher.
+#
+#   docker compose -f docker-compose.yml -f compose.prebuilt.yml up -d --wait
+#   make up PREBUILT=1
+services:
+  restful-booker:
+    image: mwinteringham/restfulbooker:latest
+    platform: linux/amd64
+    build: !reset null
